@@ -102,9 +102,31 @@ function conflictText(j) {
     return `${j.conflict_holder_label || '对端在途任务'}（任务#${j.conflict_holder_job_id}）`
   }
   if (j.status === '在途') {
-    return j.step_label || j.step
+    return j.in_flight_lock_label || j.step_label || j.step
   }
   return '—'
+}
+
+// 互斥裁决证明：在途类型、冲突对端、是否待重跑（与后端 mutex_verdicts 同源，刷新后仍在）
+function verdictText(j) {
+  const list = j.mutex_verdicts || []
+  if (!list.length) return '—'
+  return list
+    .map((v) => {
+      const peer = v.conflict_peer_label
+        ? `对端=${v.conflict_peer_label}#${v.conflict_peer_job_id}`
+        : '无冲突对端'
+      const rerun = v.needs_rerun ? '待重跑' : '无需重跑'
+      return `证明#${v.id} ${v.verdict_type_label}（在途类型=${v.request_lock_label}，${peer}，${rerun}）`
+    })
+    .join('；')
+}
+
+function verdictClass(j) {
+  const list = j.mutex_verdicts || []
+  if (list.some((v) => v.needs_rerun)) return 'fail'
+  if (list.length) return 'warn'
+  return 'muted'
 }
 </script>
 <template>
@@ -145,8 +167,10 @@ function conflictText(j) {
       <table>
         <thead>
           <tr>
-            <th>编号</th><th>步骤</th><th>结果</th><th>在途类型 / 互斥对端</th>
-            <th>原因与说明</th><th>业务日</th><th>输入</th><th>写入</th><th>剔除</th><th>时间</th>
+            <th>编号</th><th>步骤</th><th>结果</th><th>在途类型</th>
+            <th>互斥对端 / 失败原因</th><th>原因与说明</th>
+            <th>互斥裁决证明（在途类型/冲突对端/是否待重跑）</th>
+            <th>业务日</th><th>输入</th><th>写入</th><th>剔除</th><th>时间</th>
           </tr>
         </thead>
         <tbody>
@@ -154,8 +178,10 @@ function conflictText(j) {
             <td>{{ j.id }}</td>
             <td>{{ j.step_label || j.step }}</td>
             <td :class="statusClass(j.status)">{{ j.status }}</td>
+            <td>{{ j.in_flight_lock_label || (j.status === '互斥失败' ? '—' : (j.step_label || j.step)) }}</td>
             <td>{{ conflictText(j) }}</td>
             <td>{{ j.message }}</td>
+            <td :class="verdictClass(j)">{{ verdictText(j) }}</td>
             <td>{{ j.target_biz_day || '—' }}</td>
             <td>{{ j.in_count }}</td>
             <td>{{ j.out_count }}</td>

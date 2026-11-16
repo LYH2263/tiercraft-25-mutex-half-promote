@@ -85,6 +85,23 @@ CREATE TABLE IF NOT EXISTS domain_locks (
   FOREIGN KEY(job_id) REFERENCES layer_jobs(id)
 );
 
+-- 互斥裁决证明实体：每条「互斥拒绝」或「失败回滚/待重跑」裁决都落一行，
+-- 记录申请的在途类型、冲突对端（类型+任务编号）、是否待重跑，刷新与重启后仍可查。
+CREATE TABLE IF NOT EXISTS mutex_verdicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain_id INTEGER NOT NULL,
+  job_id INTEGER NOT NULL,
+  verdict_type TEXT NOT NULL,
+  request_lock_type TEXT NOT NULL DEFAULT '',
+  conflict_peer_type TEXT NOT NULL DEFAULT '',
+  conflict_peer_job_id INTEGER,
+  needs_rerun INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(domain_id) REFERENCES domains(id),
+  FOREIGN KEY(job_id) REFERENCES layer_jobs(id)
+);
+
 CREATE TABLE IF NOT EXISTS reconcile_reports (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   domain_id INTEGER NOT NULL,

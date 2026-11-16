@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 
 from app.locks import LOCK_LABELS, LockConflict
 from app.services import pipeline
+from app.services.pipeline import RecordedLockConflict
 
 router = APIRouter(tags=["分层任务"])
 
@@ -17,16 +18,17 @@ class BackfillBody(BaseModel):
 
 
 def _conflict_response(exc: LockConflict) -> HTTPException:
-    # 冲突必须失败，并写明对端在途类型；记录已在服务层落库
-    return HTTPException(
-        status_code=409,
-        detail={
-            "错误": "在途锁互斥冲突",
-            "原因": exc.message,
-            "对端在途类型": LOCK_LABELS.get(exc.holder_type, exc.holder_type),
-            "对端任务编号": exc.holder_job_id,
-        },
-    )
+    # 冲突必须失败，并写明对端在途类型；记录与裁决证明已在服务层落库
+    detail = {
+        "错误": "在途锁互斥冲突",
+        "原因": exc.message,
+        "对端在途类型": LOCK_LABELS.get(exc.holder_type, exc.holder_type),
+        "对端任务编号": exc.holder_job_id,
+    }
+    if isinstance(exc, RecordedLockConflict):
+        detail["互斥失败任务编号"] = exc.conflict_job_id
+        detail["互斥裁决证明编号"] = exc.verdict_id
+    return HTTPException(status_code=409, detail=detail)
 
 
 @router.get("/jobs")
@@ -40,6 +42,29 @@ def get_job(job_id: int):
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
     return job
+
+
+@router.get("/mutex-verdicts")
+def list_mutex_verdicts(job_id: int | None = None):
+    """互斥裁决证明实体只读列表，可按任务 id 过滤。"""
+    return pipeline.list_job_verdicts(job_id)
+
+
+@router.get("/mutex-verdicts/{verdict_id}")
+def get_mutex_verdict(verdict_id: int):
+    """按裁决证明 id 只读查询；含在途类型、冲突对端、是否待重跑。"""
+    verdict = pipeline.get_verdict(verdict_id)
+    if not verdict:
+        raise HTTPException(status_code=404, detail="互斥裁决证明不存在")
+    return verdict
+
+
+@router.get("/jobs/{job_id}/mutex-verdicts")
+def get_job_mutex_verdicts(job_id: int):
+    """按任务 id 只读查询该任务的互斥裁决证明。"""
+    if not pipeline.get_job(job_id):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return pipeline.list_job_verdicts(job_id)
 
 
 @router.get("/locks")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 
-from app import locks
+from app import locks, verdicts
 from app.db import connect, rows_to_dicts
 from app.locks import (
     LOCK_BACKFILL,
@@ -12,6 +12,7 @@ from app.locks import (
     LOCK_PASTE_TO_DETAIL,
     LockConflict,
 )
+from app.verdicts import VERDICT_CONFLICT, VERDICT_RERUN
 
 STEP_LABEL = {
     "paste_to_detail": "贴源到明细",
@@ -135,13 +136,23 @@ def list_locks(domain_id: int | None = None) -> list[dict]:
         conn.close()
 
 
-def _decorate_job(d: dict) -> dict:
+def _decorate_job(conn, d: dict) -> dict:
     d["step_label"] = STEP_LABEL.get(d["step"], d["step"])
     d["in_flight"] = d["status"] == "在途"
     if d.get("conflict_holder_type") and not d.get("conflict_holder_label"):
         d["conflict_holder_label"] = LOCK_LABELS.get(
             d["conflict_holder_type"], d["conflict_holder_type"]
         )
+    # 在途任务附上其持有的在途锁类型（与 domain_locks 同源，刷新后仍在）
+    held = conn.execute(
+        "SELECT lock_type FROM domain_locks WHERE job_id=?", (d["id"],)
+    ).fetchone()
+    d["in_flight_lock_type"] = held["lock_type"] if held else ""
+    d["in_flight_lock_label"] = (
+        LOCK_LABELS.get(held["lock_type"], held["lock_type"]) if held else ""
+    )
+    # 互斥裁决证明实体：在途类型、冲突对端、是否待重跑
+    d["mutex_verdicts"] = verdicts.list_verdicts(conn, job_id=d["id"])
     return d
 
 
@@ -149,7 +160,7 @@ def get_job(job_id: int) -> dict | None:
     conn = connect()
     try:
         row = conn.execute("SELECT * FROM layer_jobs WHERE id=?", (job_id,)).fetchone()
-        return _decorate_job(dict(row)) if row else None
+        return _decorate_job(conn, dict(row)) if row else None
     finally:
         conn.close()
 
@@ -163,7 +174,23 @@ def list_jobs(domain_id: int | None = None) -> list[dict]:
             rows = conn.execute(
                 "SELECT * FROM layer_jobs WHERE domain_id=? ORDER BY id DESC", (domain_id,)
             ).fetchall()
-        return [_decorate_job(dict(r)) for r in rows]
+        return [_decorate_job(conn, dict(r)) for r in rows]
+    finally:
+        conn.close()
+
+
+def list_job_verdicts(job_id: int | None = None) -> list[dict]:
+    conn = connect()
+    try:
+        return verdicts.list_verdicts(conn, job_id=job_id)
+    finally:
+        conn.close()
+
+
+def get_verdict(verdict_id: int) -> dict | None:
+    conn = connect()
+    try:
+        return verdicts.get_verdict(conn, verdict_id)
     finally:
         conn.close()
 
@@ -171,15 +198,17 @@ def list_jobs(domain_id: int | None = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 # 在途锁与任务生命周期
 # ---------------------------------------------------------------------------
-def _precheck_lock(domain_id: int, lock_type: str) -> None:
-    """只读预检：让并发冲突在写事务外快速失败，避免被长任务整段阻塞。"""
+def _precheck_lock(domain_id: int, lock_type: str, domain_name: str) -> None:
+    """只读预检：让并发冲突在写事务外快速失败，避免被长任务整段阻塞。
+
+    存在对端在途锁即抛 LockConflict（写明对端在途类型与任务编号）；
+    这只是快速失败路径，写事务内 acquire_lock 的 UNIQUE 约束才是最终裁决。
+    """
     conn = connect()
     try:
-        holder = locks.find_lock(conn, domain_id)
+        locks.raise_if_locked(conn, domain_id, lock_type, domain_name)
     finally:
         conn.close()
-    if holder is not None:
-        return
 
 
 def _start_job(domain_id: int, step: str, lock_type: str, biz_day: str = ""):
@@ -187,7 +216,7 @@ def _start_job(domain_id: int, step: str, lock_type: str, biz_day: str = ""):
     domain = get_domain(domain_id)
     if not domain:
         raise ValueError("主题域不存在")
-    _precheck_lock(domain_id, lock_type)
+    _precheck_lock(domain_id, lock_type, domain["name"])
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -219,12 +248,19 @@ def _start_job(domain_id: int, step: str, lock_type: str, biz_day: str = ""):
 
 
 def _record_conflict(
-    domain_id: int, step: str, exc: LockConflict, biz_day: str = ""
-) -> None:
-    """互斥失败同样落一条任务记录，写明对端在途类型，刷新后仍可查。"""
+    domain_id: int,
+    step: str,
+    lock_type: str,
+    exc: LockConflict,
+    biz_day: str = "",
+) -> tuple[int, int]:
+    """互斥失败同样落一条任务记录与互斥裁决证明，写明对端在途类型，刷新后仍可查。
+
+    返回（互斥失败任务编号，裁决证明编号）。
+    """
     conn = connect()
     try:
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO layer_jobs(
               domain_id, step, status, message,
@@ -242,17 +278,42 @@ def _record_conflict(
                 biz_day,
             ),
         )
+        conflict_job_id = int(cur.lastrowid)
+        # 裁决留证：申请的在途类型、冲突对端（类型+任务编号）、无需重跑
+        verdict_id = verdicts.insert_verdict(
+            conn,
+            domain_id=domain_id,
+            job_id=conflict_job_id,
+            verdict_type=VERDICT_CONFLICT,
+            request_lock_type=lock_type,
+            conflict_peer_type=exc.holder_type,
+            conflict_peer_job_id=exc.holder_job_id,
+            needs_rerun=False,
+            reason=exc.message,
+        )
         conn.commit()
+        return conflict_job_id, verdict_id
     finally:
         conn.close()
+
+
+class RecordedLockConflict(LockConflict):
+    """已落库留痕的互斥冲突，附带互斥失败任务编号与裁决证明编号。"""
+
+    def __init__(self, base: LockConflict, conflict_job_id: int, verdict_id: int):
+        super().__init__(base.message, base.holder_type, base.holder_job_id)
+        self.conflict_job_id = conflict_job_id
+        self.verdict_id = verdict_id
 
 
 def _guarded(domain_id: int, step: str, lock_type: str, worker, biz_day: str = ""):
     try:
         return worker()
     except LockConflict as exc:
-        _record_conflict(domain_id, step, exc, biz_day)
-        raise
+        conflict_job_id, verdict_id = _record_conflict(
+            domain_id, step, lock_type, exc, biz_day
+        )
+        raise RecordedLockConflict(exc, conflict_job_id, verdict_id) from exc
 
 
 def _mark_domain_available(conn, domain_id: int) -> None:
@@ -293,8 +354,18 @@ def _finish_ok(
     conn.commit()
 
 
-def _abort(conn, job_id: int, domain_id: int, reason: str) -> None:
-    """数据事务失败：先回滚本趟全部数据变更，再记失败、置主题域不可用、释放锁。"""
+def _abort(
+    conn,
+    job_id: int,
+    domain_id: int,
+    lock_type: str,
+    reason: str,
+) -> None:
+    """数据事务失败：先回滚本趟全部数据变更，再记失败、置主题域不可用、释放锁。
+
+    回滚后另开短事务落「失败待重跑」互斥裁决证明（needs_rerun=1），
+    保证不存在可见半态：明细与汇总要么同趟提交，要么整趟回滚。
+    """
     conn.rollback()
     conn.execute("BEGIN IMMEDIATE")
     conn.execute(
@@ -303,6 +374,15 @@ def _abort(conn, job_id: int, domain_id: int, reason: str) -> None:
     )
     _mark_domain_unavailable(conn, domain_id, reason)
     locks.release_lock(conn, job_id)
+    verdicts.insert_verdict(
+        conn,
+        domain_id=domain_id,
+        job_id=job_id,
+        verdict_type=VERDICT_RERUN,
+        request_lock_type=lock_type,
+        needs_rerun=True,
+        reason=reason,
+    )
     conn.commit()
     conn.close()
 
@@ -445,6 +525,7 @@ def _run_paste_to_detail(domain_id: int) -> dict:
             conn,
             job_id,
             domain_id,
+            LOCK_PASTE_TO_DETAIL,
             f"贴源到明细失败，本趟明细变更已整体回滚，主题域标记不可用待重跑：{exc}",
         )
     finally:
@@ -480,6 +561,7 @@ def _run_detail_to_summary(domain_id: int) -> dict:
             conn,
             job_id,
             domain_id,
+            LOCK_DETAIL_TO_SUMMARY,
             f"明细到汇总失败，汇总变更已回滚，主题域标记不可用待重跑：{exc}",
         )
     finally:
@@ -500,16 +582,17 @@ def _run_backfill(domain_id: int, biz_day: str) -> dict:
     job_id, conn = _start_job(domain_id, "backfill", LOCK_BACKFILL, biz_day=biz_day)
     try:
         conn.execute("BEGIN IMMEDIATE")
-        # 重跑指定日明细，再重算该日汇总键：同一事务，任一失败整体回滚
+        # 重跑指定日明细，再在同一事务内重算该日汇总键：任一失败整体回滚，
+        # 绝不允许「明细已变、汇总未变且任务仍显示成功」的可见半态。
         d_in, d_out, d_drop = _rebuild_detail_day(conn, domain_id, biz_day)
-        s_in, s_out = 0, 0
+        s_in, s_out = _rebuild_summary_day(conn, domain_id, biz_day)
         _finish_ok(
             conn,
             job_id,
             domain_id,
             (
                 f"定点回刷业务日 {biz_day}：重跑明细（输入{d_in}行/写入{d_out}行/剔除{d_drop}行），"
-                f"重算对应汇总键{s_out}个；在途锁已释放"
+                f"重算对应汇总键{s_out}个（覆盖明细{s_in}行）；在途锁已释放"
             ),
             d_in,
             s_out,
@@ -520,6 +603,7 @@ def _run_backfill(domain_id: int, biz_day: str) -> dict:
             conn,
             job_id,
             domain_id,
+            LOCK_BACKFILL,
             (
                 f"业务日{biz_day}定点回刷失败，本趟明细与汇总变更已整体回滚，"
                 f"主题域标记不可用待重跑：{exc}"

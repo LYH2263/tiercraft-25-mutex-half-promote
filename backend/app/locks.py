@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import sqlite3
 
+from app import verdicts
+
 LOCK_PASTE_TO_DETAIL = "paste_to_detail"
 LOCK_DETAIL_TO_SUMMARY = "detail_to_summary"
 LOCK_BACKFILL = "backfill"
@@ -47,6 +49,29 @@ def find_lock(conn: sqlite3.Connection, domain_id: int) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def raise_if_locked(
+    conn: sqlite3.Connection, domain_id: int, request_type: str, domain_name: str
+) -> None:
+    """只读预检：存在对端在途锁即抛 LockConflict，写明对端在途类型与任务编号。
+
+    预检只是快速失败路径，真正的互斥裁决由 domain_locks.domain_id 的
+    UNIQUE 约束在写事务内兜底（见 acquire_lock）。
+    """
+    holder = find_lock(conn, domain_id)
+    if holder is None:
+        return
+    raise LockConflict(
+        conflict_message(
+            domain_name,
+            holder["lock_type"],
+            int(holder["job_id"]),
+            request_type,
+        ),
+        holder["lock_type"],
+        int(holder["job_id"]),
+    )
+
+
 def acquire_lock(
     conn: sqlite3.Connection,
     domain_id: int,
@@ -54,10 +79,23 @@ def acquire_lock(
     job_id: int,
     domain_name: str,
 ) -> None:
-    """在已开启的写事务内抢锁；抢到则插入锁行，否则抛 LockConflict。"""
+    """在已开启的写事务内抢锁；抢到则插入锁行，否则抛 LockConflict。
+
+    裁决依据是 domain_locks.domain_id 的 UNIQUE 约束：同一主题域任一时刻
+    至多一行在途锁，回刷与两类提升、两类提升之间全部互斥。
+    """
     holder = find_lock(conn, domain_id)
     if holder is not None:
-        return
+        raise LockConflict(
+            conflict_message(
+                domain_name,
+                holder["lock_type"],
+                int(holder["job_id"]),
+                lock_type,
+            ),
+            holder["lock_type"],
+            int(holder["job_id"]),
+        )
     try:
         conn.execute(
             "INSERT INTO domain_locks(domain_id, lock_type, job_id) VALUES (?, ?, ?)",
@@ -116,7 +154,8 @@ def recover_stale_locks(conn: sqlite3.Connection) -> int:
     for row in stale:
         job_id = int(row["job_id"])
         domain_id = int(row["domain_id"])
-        label = LOCK_LABELS.get(row["lock_type"], row["lock_type"])
+        lock_type = row["lock_type"]
+        label = LOCK_LABELS.get(lock_type, lock_type)
         reason = f"进程中断，{label}（任务#{job_id}）未正常结束，在途锁已回收，主题域标记不可用待重跑"
         conn.execute(
             "UPDATE layer_jobs SET status='失败', message=?, finished_at=datetime('now') WHERE id=?",
@@ -126,5 +165,15 @@ def recover_stale_locks(conn: sqlite3.Connection) -> int:
         conn.execute(
             "UPDATE domains SET available=0, unavailable_reason=? WHERE id=?",
             (reason, domain_id),
+        )
+        # 裁决留证：中断任务按「失败待重跑」处理，needs_rerun=1
+        verdicts.insert_verdict(
+            conn,
+            domain_id=domain_id,
+            job_id=job_id,
+            verdict_type=verdicts.VERDICT_RERUN,
+            request_lock_type=lock_type,
+            needs_rerun=True,
+            reason=reason,
         )
     return len(stale)

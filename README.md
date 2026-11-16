@@ -56,6 +56,28 @@ npm run dev
 任务记录（`layer_jobs`）与在途锁同源落 SQLite，在途态、互斥失败原因、任务结果刷新页面
 后仍在；进程重启时残留的在途锁会被回收，对应任务判失败并标记主题域不可用待重跑。
 
+## 互斥裁决证明（`mutex_verdicts`）
+
+每次互斥裁决都新增一条只增不改的证明实体，刷新页面或重启后仍可查，字段含：
+
+- 申请的在途类型（`request_lock_type`）；
+- 冲突对端（对端在途类型 `conflict_peer_type` 与对端任务编号 `conflict_peer_job_id`）；
+- 是否待重跑（`needs_rerun`）。
+
+两类裁决：
+
+- 「互斥拒绝」（`mutex_conflict`）：对端在途，本次请求未启动，`needs_rerun=0`；
+- 「失败待重跑」（`needs_rerun`）：任务启动后失败，本趟变更整趟回滚、主题域不可用，
+  `needs_rerun=1`；进程重启回收残留锁同样落此类证明。
+
+只读接口（无任何写入入口）：
+
+- `GET /api/mutex-verdicts`：全部证明，可用 `?job_id=` 按任务 id 过滤；
+- `GET /api/mutex-verdicts/{id}`：按证明 id 查询；
+- `GET /api/jobs/{job_id}/mutex-verdicts`：按任务 id 查询该任务的证明；
+- `GET /api/jobs` 与 `GET /api/jobs/{id}` 的每条任务内嵌 `mutex_verdicts`，
+  在途任务另带 `in_flight_lock_type`（在途类型）。
+
 ## 界面约定
 
 页面文案全部中文；分层称「贴源层 / 明细层 / 汇总层」，界面不出现英文缩写站名。
